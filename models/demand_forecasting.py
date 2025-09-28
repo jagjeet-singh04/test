@@ -120,8 +120,16 @@ class DemandForecaster:
         
         return product_data.dropna()
     
-    def forecast_product_demand(self, demand_data, product_name, days_ahead=30):
-        """Forecast demand for a specific product using simple methods"""
+    def forecast_product_demand(self, demand_data, product_name, days_ahead=30, confidence: int | float | None = None, seasonal: bool = True):
+        """Forecast demand for a specific product.
+
+        Parameters:
+        - demand_data: prepared product demand data (from prepare_product_demand_data)
+        - product_name: name of product to forecast
+        - days_ahead: forecast horizon in days
+        - confidence: optional confidence level (e.g., 80..99) for yhat_lower/yhat_upper
+        - seasonal: include seasonal and trend components in the ensemble if True
+        """
         product_data = self.create_demand_features(demand_data, product_name)
         
         if len(product_data) < 14:  # Need at least 2 weeks of data
@@ -163,13 +171,12 @@ class DemandForecaster:
         
         # Ensemble forecast (average of methods)
         ensemble_forecast = []
+        components = ['moving_average', 'exponential_smoothing']
+        if seasonal:
+            components += ['seasonal', 'trend_adjusted']
         for i in range(days_ahead):
-            avg_forecast = np.mean([
-                forecasts['moving_average'][i],
-                forecasts['exponential_smoothing'][i],
-                forecasts['seasonal'][i],
-                forecasts['trend_adjusted'][i]
-            ])
+            values = [forecasts[c][i] for c in components]
+            avg_forecast = np.mean(values)
             ensemble_forecast.append(max(0, avg_forecast))
         
         # Create forecast dataframe
@@ -185,6 +192,29 @@ class DemandForecaster:
             'seasonal': forecasts['seasonal'],
             'trend_adjusted': forecasts['trend_adjusted']
         })
+
+        # Optional confidence interval based on in-sample residual stddev of chosen ensemble
+        if confidence is not None:
+            try:
+                # Build naive in-sample ensemble fit
+                hist_values = product_data['quantity_demanded'].values
+                # Align last len(hist_values) days with available features; use last 14 days for sigma
+                window = min(30, len(product_data))
+                # Recreate component fits for last window days where possible
+                # For simplicity, use residuals to moving avg baseline as proxy
+                baseline = product_data.tail(window)['quantity_demanded'].rolling(7).mean().bfill()
+                residuals = product_data.tail(window)['quantity_demanded'] - baseline
+                sigma = float(np.nanstd(residuals.values, ddof=1)) if len(residuals) > 1 else 0.0
+                if sigma > 0:
+                    z_map = {80: 1.282, 85: 1.440, 90: 1.645, 95: 1.960, 98: 2.326, 99: 2.576}
+                    c = int(round(float(confidence)))
+                    z = z_map.get(c, z_map[min(z_map.keys(), key=lambda k: abs(k - c))])
+                    lower = np.clip(np.array(ensemble_forecast) - z * sigma, a_min=0.0, a_max=None)
+                    upper = np.clip(np.array(ensemble_forecast) + z * sigma, a_min=0.0, a_max=None)
+                    forecast_df['yhat_lower'] = lower
+                    forecast_df['yhat_upper'] = upper
+            except Exception:
+                pass
         
         return forecast_df
     
