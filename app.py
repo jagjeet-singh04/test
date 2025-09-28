@@ -11,7 +11,7 @@ from models.customer_segmentation import CustomerSegmentation
 from models.demand_forecasting import DemandForecaster
 from scripts.data_processor import DataProcessor
 
-st.set_page_config(page_title="Customer Intelligence Dashboard", layout="wide")
+st.set_page_config(page_title="FORESIGHT", layout="wide")
 
 st.markdown(
     """
