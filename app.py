@@ -1003,7 +1003,7 @@ def demand_forecasting_page(df):
 
 def main():
     """Main application with enhanced navigation and welcome page"""
-    st.markdown('<div class="main-header">📊 Customer Intelligence Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">📊 FORESIGHT</div>', unsafe_allow_html=True)
     
     # Enhanced sidebar with better styling
     with st.sidebar:
@@ -1088,7 +1088,7 @@ def main():
         # Enhanced welcome page
         st.markdown("""
         <div style="text-align: center; padding: 2rem 0;">
-            <h1 style="color: #2c3e50; margin-bottom: 1rem;">Welcome to Customer Intelligence Dashboard! 🚀</h1>
+            <h1 style="color: #2c3e50; margin-bottom: 1rem;">Welcome to FORESIGHT! 🚀</h1>
             <p style="font-size: 1.2rem; color: #7f8c8d; max-width: 800px; margin: 0 auto 2rem auto;">
                 Transform your customer data into actionable insights with our comprehensive analytics platform.
             </p>
