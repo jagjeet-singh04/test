@@ -16,96 +16,157 @@ class CustomerSegmentation:
         self.pca = None
         self.n_clusters = None
         self.is_fitted = False
+        self.feature_names = []
+    
+    def _first_present_col(self, df, candidates):
+        """Find the first column present from a list of candidate names (case-insensitive)."""
+        lower_map = {c.lower(): c for c in df.columns}
+        for cand in candidates:
+            if cand.lower() in lower_map:
+                return lower_map[cand.lower()]
+        return None
+    
+    def _to_numeric(self, s, clip_min=None, clip_max=None):
+        s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
+        if clip_min is not None or clip_max is not None:
+            s = np.clip(s, a_min=clip_min if clip_min is not None else -np.inf,
+                        a_max=clip_max if clip_max is not None else np.inf)
+        return s
         
     def prepare_segmentation_features(self, df):
         """Prepare features for customer segmentation"""
         features = []
         feature_names = []
         
-        # RFM Analysis features
-        if all(col in df.columns for col in ['total_revenue', 'purchase_frequency', 'days_since_last_purchase']):
-            # Recency (lower is better)
-            features.append(df['days_since_last_purchase'].values)
+        # RFM: add whichever is available, using common synonyms
+        recency_col = self._first_present_col(df, ['days_since_last_purchase', 'recency', 'days_since_last_order', 'days_since_last_txn'])
+        if recency_col:
+            features.append(self._to_numeric(df[recency_col], clip_min=0, clip_max=36500).values)
             feature_names.append('recency')
-            
-            # Frequency (higher is better)
-            features.append(df['purchase_frequency'].values)
+        
+        frequency_col = self._first_present_col(df, ['purchase_frequency', 'frequency', 'orders_count', 'num_orders', 'purchase_count'])
+        if frequency_col:
+            features.append(self._to_numeric(df[frequency_col], clip_min=0, clip_max=1e5).values)
             feature_names.append('frequency')
-            
-            # Monetary (higher is better)
-            features.append(df['total_revenue'].values)
+        
+        monetary_col = self._first_present_col(df, ['total_revenue', 'revenue', 'sales', 'amount', 'lifetime_value', 'clv', 'cltv'])
+        if monetary_col:
+            features.append(self._to_numeric(df[monetary_col], clip_min=0, clip_max=1e9).values)
             feature_names.append('monetary')
         
         # Customer lifetime and engagement
-        if 'customer_lifetime_days' in df.columns:
-            features.append(df['customer_lifetime_days'].values)
+        lifetime_col = self._first_present_col(df, ['customer_lifetime_days', 'lifetime_days', 'tenure_days', 'tenure'])
+        if lifetime_col:
+            features.append(self._to_numeric(df[lifetime_col], clip_min=0, clip_max=36500).values)
             feature_names.append('lifetime_days')
-            
-        if 'cancellations_count' in df.columns:
-            features.append(df['cancellations_count'].values)
+        
+        cancels_col = self._first_present_col(df, ['cancellations_count', 'cancellations', 'cancel_count', 'refunds_count', 'returns_count'])
+        if cancels_col:
+            features.append(self._to_numeric(df[cancels_col], clip_min=0, clip_max=1e4).values)
             feature_names.append('cancellations')
-            
-        if 'Ratings' in df.columns:
-            features.append(df['Ratings'].values)
+        
+        rating_col = self._first_present_col(df, ['Ratings', 'ratings', 'rating', 'avg_rating'])
+        if rating_col:
+            features.append(self._to_numeric(df[rating_col], clip_min=0, clip_max=10).values)
             feature_names.append('ratings')
-            
-        # Demographic features
-        if 'age' in df.columns:
-            features.append(df['age'].values)
+        
+        # Demographics / price-quantity if present
+        age_col = self._first_present_col(df, ['age', 'customer_age'])
+        if age_col:
+            features.append(self._to_numeric(df[age_col], clip_min=0, clip_max=120).values)
             feature_names.append('age')
-            
-        # Create feature matrix
-        if features:
-            X = np.column_stack(features)
-            self.feature_names = feature_names
-            return X
-        else:
-            raise ValueError("No suitable features found for segmentation")
+        
+        qty_col = self._first_present_col(df, ['quantity', 'qty', 'units'])
+        if qty_col:
+            features.append(self._to_numeric(df[qty_col], clip_min=0, clip_max=1e6).values)
+            feature_names.append('quantity')
+        
+        price_col = self._first_present_col(df, ['unit_price', 'price'])
+        if price_col:
+            features.append(self._to_numeric(df[price_col], clip_min=0, clip_max=1e6).values)
+            feature_names.append('unit_price')
+        
+        # If no features detected, attempt fallback: all numeric columns except known targets
+        if not features:
+            numeric_df = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0)
+            drop_candidates = [
+                'is_churned', 'churn_probability', 'cluster', 'pca_1', 'pca_2'
+            ]
+            numeric_df = numeric_df[[c for c in numeric_df.columns if c not in drop_candidates]]
+            if numeric_df.shape[1] == 0:
+                raise ValueError("No suitable numeric features found for segmentation")
+            features = [numeric_df[c].values for c in numeric_df.columns]
+            feature_names = list(numeric_df.columns)
+        
+        X = np.column_stack(features)
+        self.feature_names = feature_names
+        return X
     
     def find_optimal_clusters(self, X, max_clusters=10):
         """Find optimal number of clusters using elbow method and silhouette score"""
+        n_samples = len(X)
+        if n_samples < 2:
+            raise ValueError("At least 2 samples required to estimate clusters")
         X_scaled = self.scaler.fit_transform(X)
         
         inertias = []
-        silhouette_scores = []
-        K_range = range(2, min(max_clusters + 1, len(X)))
+        sil_scores = []
+        K_max = min(max_clusters, n_samples - 1)
+        if K_max < 2:
+            K_max = 2
+        K_range = list(range(2, K_max + 1))
         
         for k in K_range:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            kmeans.fit(X_scaled)
-            inertias.append(kmeans.inertia_)
-            silhouette_scores.append(silhouette_score(X_scaled, kmeans.labels_))
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = km.fit_predict(X_scaled)
+            inertias.append(km.inertia_)
+            try:
+                sil = silhouette_score(X_scaled, labels)
+            except Exception:
+                sil = np.nan
+            sil_scores.append(sil)
         
-        # Find elbow point (simplified)
-        optimal_k = K_range[np.argmax(silhouette_scores)]
+        # Prefer best silhouette score if available; otherwise fallback to min inertia elbow-ish
+        if np.all(np.isnan(sil_scores)):
+            optimal_k = K_range[int(np.argmin(inertias))] if K_range else 2
+        else:
+            # Replace NaNs with -inf to ignore them
+            sil_array = np.array([(-np.inf if np.isnan(s) else s) for s in sil_scores])
+            optimal_k = K_range[int(np.argmax(sil_array))]
         
-        return optimal_k, inertias, silhouette_scores, K_range
+        return optimal_k, inertias, sil_scores, K_range
     
     def segment_customers(self, df, n_clusters=None):
         """Segment customers using K-means clustering"""
         X = self.prepare_segmentation_features(df)
         
         if n_clusters is None:
-            n_clusters, _, _, _ = self.find_optimal_clusters(X)
+            try:
+                n_clusters, _, _, _ = self.find_optimal_clusters(X)
+            except Exception:
+                n_clusters = min(3, max(2, len(X)))  # fallback
         
-        self.n_clusters = n_clusters
+        # Ensure n_clusters valid
+        self.n_clusters = max(2, min(n_clusters, len(X)))
         
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
         # Apply K-means
-        self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
         cluster_labels = self.kmeans.fit_predict(X_scaled)
         
         # Apply PCA for visualization
-        self.pca = PCA(n_components=2)
+        n_components = 2 if X_scaled.shape[1] >= 2 else 1
+        self.pca = PCA(n_components=n_components)
         X_pca = self.pca.fit_transform(X_scaled)
         
         # Create results dataframe
         results_df = df.copy()
         results_df['cluster'] = cluster_labels
         results_df['pca_1'] = X_pca[:, 0]
-        results_df['pca_2'] = X_pca[:, 1]
+        if n_components == 2:
+            results_df['pca_2'] = X_pca[:, 1]
         
         self.is_fitted = True
         

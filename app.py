@@ -19,10 +19,11 @@ from models.churn_analysis import AdvancedChurnAnalyzer
 from models.customer_segmentation import CustomerSegmentation
 from models.sales_forecasting import AdvancedSalesForecaster
 from models.demand_forecasting import DemandForecaster
+ 
 
 # Page configuration
 st.set_page_config(
-    page_title="Customer Churn & Sales Forecasting Dashboard",
+    page_title="FORESIGHT",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -219,8 +220,9 @@ def churn_analysis_page(df):
         col1, col2 = st.columns([1, 3])
         with col1:
             top_n = st.slider("Number of customers to show", 5, 50, 10)
+            high_only_flag = st.checkbox("High risk only", value=True, help="Show only customers classified as High risk")
         
-        top_risk_customers = churn_analyzer.get_top_risk_customers(df, X, top_n)
+        top_risk_customers = churn_analyzer.get_top_risk_customers(df, X, top_n=top_n, high_only=high_only_flag)
         
         st.dataframe(top_risk_customers)
         
@@ -401,6 +403,33 @@ def sales_forecasting_page(df):
         
     except Exception as e:
         st.error(f"Error in sales forecasting: {str(e)}")
+
+    # --- Quarterly forecast (simple) ---
+    st.markdown("---")
+    st.markdown("### 📆 Quarterly Forecast (simple)")
+    try:
+        colq1, colq2 = st.columns(2)
+        with colq1:
+            q_periods = st.slider("Quarters to forecast", 1, 8, 4)
+        with colq2:
+            q_cap = st.number_input("Quarterly capacity cap (0 = none)", min_value=0.0, value=0.0, step=1000.0)
+
+        res = sales_forecaster.forecast_quarterly_sales(df, periods=int(q_periods), inventory_cap=float(q_cap))
+        q_hist = res['historical']
+        q_fc = res['forecast'].copy()
+        q_fc['Quarter'] = q_fc['ds'].dt.to_period('Q').astype(str)
+
+        # Chart
+        figq = go.Figure()
+        figq.add_trace(go.Scatter(x=q_hist['ds'], y=q_hist['y'], mode='lines+markers', name='Historical'))
+        figq.add_trace(go.Scatter(x=q_fc['ds'], y=q_fc['yhat_capped'], mode='lines+markers', name='Forecast', line=dict(dash='dash')))
+        figq.update_layout(height=420, template='plotly_white', title='Quarterly Revenue Forecast')
+        st.plotly_chart(figq, use_container_width=True)
+
+        # Table
+        st.dataframe(q_fc[['Quarter', 'ds', 'yhat', 'yhat_capped']].rename(columns={'yhat': 'Predicted', 'yhat_capped': 'Predicted (capped)'}))
+    except Exception as e:
+        st.info(f"Quarterly forecast not available: {e}")
 
 def customer_segmentation_page(df):
     """Customer segmentation page"""
@@ -670,7 +699,7 @@ def demand_forecasting_page(df):
 
 def main():
     """Main application"""
-    st.markdown('<div class="main-header">📊 Customer Churn & Sales Forecasting Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">📊 FORESIGHT</div>', unsafe_allow_html=True)
     
     # Sidebar
     st.sidebar.title("Navigation")

@@ -30,34 +30,60 @@ class AdvancedSalesForecaster:
 		self._recent_avg_window = 14
 		self._linreg = None  # LinearRegression on time index
 		self._train_df: pd.DataFrame | None = None
+		self._detected_cols: dict | None = None
+
+	# -------------------- Helpers for adaptive schemas --------------------
+	def _first_present_col(self, df: pd.DataFrame, candidates: list[str]) -> str | None:
+		lower_map = {c.lower(): c for c in df.columns}
+		for cand in candidates:
+			if cand.lower() in lower_map:
+				return lower_map[cand.lower()]
+		return None
+
+	def _to_numeric(self, s: pd.Series, clip_min=None, clip_max=None) -> pd.Series:
+		s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
+		if clip_min is not None or clip_max is not None:
+			s = np.clip(s, a_min=clip_min if clip_min is not None else -np.inf,
+						a_max=clip_max if clip_max is not None else np.inf)
+		return s
+
+	def _ensure_datetime(self, s: pd.Series) -> pd.Series:
+		return pd.to_datetime(s, errors='coerce')
 
 	def prepare_sales_data(self, df: pd.DataFrame) -> pd.DataFrame | None:
 		if df is None or df.empty:
 			return None
 
 		data = df.copy()
-		# Parse date
-		if 'last_purchase_date' not in data.columns:
+		# Detect date/quantity/revenue/order columns
+		date_col = self._first_present_col(data, ['last_purchase_date', 'order_date', 'invoice_date', 'date', 'purchase_date', 'transaction_date'])
+		if date_col is None:
 			return None
-		data['last_purchase_date'] = pd.to_datetime(data['last_purchase_date'], errors='coerce')
-		data = data.dropna(subset=['last_purchase_date'])
+		data[date_col] = self._ensure_datetime(data[date_col])
+		data = data.dropna(subset=[date_col])
 
 		# Compute revenue if not present
-		if 'total_revenue' in data.columns:
-			revenue = pd.to_numeric(data['total_revenue'], errors='coerce').fillna(0)
+		revenue_col = self._first_present_col(data, ['total_revenue', 'revenue', 'amount', 'sales'])
+		if revenue_col is not None:
+			revenue = self._to_numeric(data[revenue_col], 0, 1e12)
 		else:
-			unit_price = pd.to_numeric(data.get('unit_price', 0), errors='coerce').fillna(0)
-			qty = pd.to_numeric(data.get('quantity', 0), errors='coerce').fillna(0)
+			unit_price_col = self._first_present_col(data, ['unit_price', 'price'])
+			qty_col = self._first_present_col(data, ['quantity', 'qty', 'units'])
+			unit_price = self._to_numeric(data[unit_price_col], 0, 1e6) if unit_price_col else 0
+			qty = self._to_numeric(data[qty_col], 0, 1e6) if qty_col else 0
 			revenue = unit_price * qty
 
 		data['_revenue'] = revenue
 
 		# Aggregate per day
-		date_key = data['last_purchase_date'].dt.date
+		date_key = data[date_col].dt.date
+		# Quantity and order fields (fallbacks)
+		qty_col = self._first_present_col(data, ['quantity', 'qty', 'units'])
+		order_id_col = self._first_present_col(data, ['order_id', 'invoice_no', 'transaction_id', 'orderid'])
 		grouped = data.groupby(date_key).agg(
 			revenue=('_revenue', 'sum'),
-			quantity_sold=('quantity', 'sum') if 'quantity' in data.columns else ('_revenue', 'size'),
-			orders_count=('order_id', 'nunique') if 'order_id' in data.columns else ('_revenue', 'size'),
+			quantity_sold=(qty_col, 'sum') if qty_col else ('_revenue', 'size'),
+			orders_count=(order_id_col, 'nunique') if order_id_col else ('_revenue', 'size'),
 		).reset_index(names='date')
 
 		grouped['date'] = pd.to_datetime(grouped['date'])
@@ -145,7 +171,7 @@ class AdvancedSalesForecaster:
 		# Return as primitive dict for app display
 		return {k: {'mae': v.mae, 'mse': v.mse, 'r2': v.r2} for k, v in results.items()}
 
-	def forecast_future_sales(self, days_ahead: int, target_metric: str = 'revenue') -> pd.DataFrame:
+	def forecast_future_sales(self, days_ahead: int, target_metric: str = 'revenue', confidence: int | float | None = None) -> pd.DataFrame:
 		if self._train_df is None or self._train_df.empty:
 			raise ValueError("Model not trained. Call train_forecasting_models() first.")
 
@@ -160,31 +186,67 @@ class AdvancedSalesForecaster:
 
 		# Generate predictions using the chosen best model (recomputed on selected metric)
 		preds = None
+		residual_sigma = None
 		if self.best_model_name == 'moving_average':
 			w = min(self._recent_avg_window, len(series))
 			avg_val = series[-w:].mean() if w > 0 else series.mean()
 			preds = np.full(shape=days_ahead, fill_value=max(0.0, avg_val), dtype=float)
+			# residuals relative to recent average
+			if w > 1:
+				residuals = series[-w:] - avg_val
+				residual_sigma = float(np.nanstd(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 		elif self.best_model_name == 'seasonal_dow':
 			# Compute seasonal avg by actual weekday for this metric
 			dow = df['date'].dt.weekday
 			seasonal = df.groupby(dow)[target_metric].mean().to_dict()
 			start_dow = (last_date.weekday() + 1) % 7
 			preds = np.array([float(seasonal.get((start_dow + i) % 7, series[-14:].mean())) for i in range(days_ahead)], dtype=float)
+			# residuals against seasonal means for training period
+			train_pred = np.array([float(seasonal.get(int(d), series.mean())) for d in dow], dtype=float)
+			residuals = series - train_pred
+			residual_sigma = float(np.nanstd(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 		elif self.best_model_name == 'linear_trend':
 			X_full = np.arange(len(series)).reshape(-1, 1)
 			lr = LinearRegression().fit(X_full, series)
 			X_fut = np.arange(len(series), len(series) + days_ahead).reshape(-1, 1)
 			preds = lr.predict(X_fut)
 			preds = np.clip(preds, a_min=0.0, a_max=None)
+			# in-sample residuals
+			train_fit = lr.predict(X_full)
+			residuals = series - train_fit
+			residual_sigma = float(np.nanstd(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 		else:
 			# Fallback
 			avg_val = series[-14:].mean() if len(series) >= 14 else series.mean()
 			preds = np.full(shape=days_ahead, fill_value=max(0.0, avg_val), dtype=float)
+			residual_sigma = float(np.nanstd(series - avg_val, ddof=1)) if len(series) > 1 else 0.0
 
-		return pd.DataFrame({
+		out = pd.DataFrame({
 			'date': future_dates,
 			f'predicted_{target_metric}': preds
 		})
+
+		# Optional confidence interval
+		if confidence is not None and residual_sigma is not None and residual_sigma > 0:
+			# Map common confidence levels to z-scores; default to nearest key if not exact
+			z_map = {80: 1.282, 85: 1.440, 90: 1.645, 95: 1.960, 98: 2.326, 99: 2.576}
+			try:
+				c = float(confidence)
+				nc = int(round(c))
+				z = z_map.get(nc)
+				if z is None:
+					# clamp to available keys
+					closest = min(z_map.keys(), key=lambda k: abs(k - nc))
+					z = z_map[closest]
+			except Exception:
+				z = 1.645  # default ~90%
+			lower = preds - z * residual_sigma
+			upper = preds + z * residual_sigma
+			# clip lower bound at 0 for non-negative metrics
+			out['yhat_lower'] = np.clip(lower, a_min=0.0, a_max=None)
+			out['yhat_upper'] = np.clip(upper, a_min=0.0, a_max=None)
+
+		return out
 
 	def analyze_sales_trends(self, sales_data: pd.DataFrame) -> dict:
 		if sales_data is None or sales_data.empty:
@@ -199,6 +261,76 @@ class AdvancedSalesForecaster:
 				'by_day_of_week': df.groupby('day_of_week')['revenue'].mean().to_dict(),
 			}
 		}
+
+	# -------------------- Quarterly forecasting --------------------
+	def prepare_quarterly_data(self, df: pd.DataFrame) -> pd.DataFrame | None:
+		"""Aggregate input data into quarterly revenue time series with columns [ds, y].
+
+		Accepts raw transactional dataframe or daily-aggregated output of prepare_sales_data.
+		"""
+		if df is None or df.empty:
+			return None
+
+		# If already looks like daily aggregated output
+		if {'date', 'revenue'}.issubset(df.columns):
+			daily = df[['date', 'revenue']].copy()
+			if not np.issubdtype(daily['date'].dtype, np.datetime64):
+				daily['date'] = pd.to_datetime(daily['date'], errors='coerce')
+			daily = daily.dropna(subset=['date'])
+		else:
+			# Build from raw using existing helper
+			daily = self.prepare_sales_data(df)
+			if daily is None or daily.empty:
+				return None
+
+		q = (
+			daily.set_index('date')['revenue']
+			.resample('Q').sum()
+			.reset_index()
+			.rename(columns={'date': 'ds', 'revenue': 'y'})
+		)
+		q = q.sort_values('ds').reset_index(drop=True)
+		return q
+
+	def forecast_quarterly_sales(self, df: pd.DataFrame, periods: int = 4, inventory_cap: float = 0.0) -> dict:
+		"""Forecast next `periods` quarters of revenue.
+
+		Returns dict with keys:
+		- historical: DataFrame [ds, y]
+		- forecast: DataFrame [ds, yhat, yhat_capped]
+		"""
+		q = self.prepare_quarterly_data(df)
+		if q is None or len(q) < 4:
+			raise ValueError('Need at least 4 quarters of data to forecast.')
+
+		last_known = pd.to_datetime(q['ds'].max())
+		forecast_df = None
+
+		# Try Prophet if available
+		try:
+			from prophet import Prophet  # type: ignore
+			m = Prophet(interval_width=0.90, yearly_seasonality=True)
+			m.add_seasonality(name='quarterly', period=91.25, fourier_order=6)
+			m.fit(q[['ds', 'y']])
+			future = m.make_future_dataframe(periods=periods, freq='Q')
+			pred_full = m.predict(future)[['ds', 'yhat']]
+			forecast_df = pred_full[pred_full['ds'] > last_known].reset_index(drop=True)
+		except Exception:
+			# Fallback: simple linear trend on quarterly index
+			y = q['y'].astype(float).values
+			X = np.arange(len(y)).reshape(-1, 1)
+			lr = LinearRegression().fit(X, y)
+			X_fut = np.arange(len(y), len(y) + periods).reshape(-1, 1)
+			yhat = lr.predict(X_fut).clip(min=0.0)
+			future_ds = pd.date_range(start=last_known + pd.offsets.QuarterEnd(), periods=periods, freq='Q')
+			forecast_df = pd.DataFrame({'ds': future_ds, 'yhat': yhat})
+
+		if inventory_cap and inventory_cap > 0:
+			forecast_df['yhat_capped'] = forecast_df['yhat'].clip(upper=inventory_cap)
+		else:
+			forecast_df['yhat_capped'] = forecast_df['yhat']
+
+		return {'historical': q, 'forecast': forecast_df}
 
 
 # Example usage
